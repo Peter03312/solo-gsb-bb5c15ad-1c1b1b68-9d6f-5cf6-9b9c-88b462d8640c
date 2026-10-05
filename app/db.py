@@ -2,10 +2,13 @@
 
 - 显式事务：写操作在 BEGIN IMMEDIATE 事务中进行，防止答卷与结算并发竞态。
 - 所有时间戳统一为服务端 Unix 秒（INTEGER）。
+- events 表为操作时间线：事件与业务状态在同一写事务内提交，自增 id 即提交顺序。
 """
 
+import json
 import os
 import sqlite3
+import time
 from contextlib import contextmanager
 
 DB_PATH = os.environ.get("SNIFF_DB_PATH", "/data/sniff.db")
@@ -26,6 +29,16 @@ CREATE TABLE IF NOT EXISTS tests (
     p_value            REAL,
     distinguishable    INTEGER
 );
+
+CREATE TABLE IF NOT EXISTS events (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,   -- 全局提交顺序（稳定排序键）
+    test_id     INTEGER NOT NULL REFERENCES tests(id),
+    ts          INTEGER NOT NULL,                    -- 服务端事件时间（秒，事务内采集）
+    type        TEXT NOT NULL,   -- create/answer/adjust/settle/history_start
+    payload     TEXT NOT NULL DEFAULT '{}'           -- JSON，盲态字段读取时再裁剪
+);
+
+CREATE INDEX IF NOT EXISTS idx_events_test ON events(test_id, id);
 
 CREATE TABLE IF NOT EXISTS assignments (
     id           INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -67,6 +80,47 @@ def init_db():
         conn.commit()
     finally:
         conn.close()
+    # 兼容旧库：events 表上线前创建的测试没有任何操作记录。
+    # 为每个这样的测试补一条明确的“记录起点”标记，不重建、不虚构既往操作。
+    backfill_history_markers()
+
+
+def backfill_history_markers():
+    """为缺少任何事件的旧测试补 history_start 起点标记（幂等）。"""
+    conn = connect()
+    try:
+        rows = conn.execute(
+            "SELECT id, created_at FROM tests t WHERE NOT EXISTS ("
+            "SELECT 1 FROM events e WHERE e.test_id = t.id)"
+        ).fetchall()
+        marker_ts = int(time.time())
+        for r in rows:
+            conn.execute(
+                "INSERT INTO events (test_id, ts, type, payload) "
+                "VALUES (?, ?, 'history_start', ?)",
+                (
+                    r["id"],
+                    marker_ts,
+                    json.dumps({
+                        "note": "操作时间线自本次升级起开始记录；该测试创建于旧版本，"
+                                "既往创建、名单调整、答卷与结算操作无可追溯记录，"
+                                "不做历史重建。",
+                        "legacy_created_at": r["created_at"],
+                    }, ensure_ascii=False),
+                ),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def log_event(conn, test_id: int, ts: int, event_type: str, payload: dict):
+    """在当前写事务内追加一条时间线事件；随业务状态一起提交或回滚。"""
+    conn.execute(
+        "INSERT INTO events (test_id, ts, type, payload) VALUES (?, ?, ?, ?)",
+        (test_id, ts, event_type,
+         json.dumps(payload, ensure_ascii=False)),
+    )
 
 
 @contextmanager

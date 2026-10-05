@@ -113,6 +113,67 @@ try:
     s, t = req("GET", "/api/time")
     check("GET /api/time", s == 200 and "now" in t)
 
+    # --- 2.0 旧库兼容：服务启动前用旧版表结构直接造一个已结算的旧测试 ---
+    import hashlib as _hashlib
+    legacy_code = "Leg0ld01"
+    legacy_token = "legacy-token-1234"
+    legacy_deadline = int(time.time()) - 3600
+    legacy_settled = int(time.time()) - 1800
+    lcon = sqlite3.connect(db_path)
+    lcon.execute(
+        "CREATE TABLE IF NOT EXISTS tests ("
+        "id INTEGER PRIMARY KEY AUTOINCREMENT, code TEXT NOT NULL UNIQUE, "
+        "token_hash TEXT NOT NULL, sample_a TEXT NOT NULL, sample_b TEXT NOT NULL, "
+        "deadline INTEGER NOT NULL, min_valid INTEGER NOT NULL, created_at INTEGER, "
+        "settled_at INTEGER, valid_count INTEGER, correct_count INTEGER, "
+        "p_value REAL, distinguishable INTEGER)")
+    lcon.execute(
+        "INSERT INTO tests (code, token_hash, sample_a, sample_b, deadline, "
+        "min_valid, created_at, settled_at, valid_count, correct_count, p_value, "
+        "distinguishable) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+        (legacy_code,
+         _hashlib.sha256(f"{legacy_code}:{legacy_token}".encode()).hexdigest(),
+         "OLD-A", "OLD-B", legacy_deadline, 1, legacy_deadline - 7200,
+         legacy_settled, 1, 1, 1 / 3, 0))
+    lcon.execute(
+        "CREATE TABLE IF NOT EXISTS assignments ("
+        "id INTEGER PRIMARY KEY AUTOINCREMENT, test_id INTEGER NOT NULL, "
+        "panelist TEXT NOT NULL, code TEXT NOT NULL UNIQUE, odd_pos INTEGER, "
+        "odd_sample TEXT, answer INTEGER, answered_at INTEGER, "
+        "UNIQUE(test_id, panelist))")
+    lcon.execute(
+        "INSERT INTO assignments (test_id, panelist, code, odd_pos, odd_sample, "
+        "answer, answered_at) VALUES "
+        "((SELECT id FROM tests WHERE code=?), '老评员', 'LEGACYCODE1', "
+        "1, 'A', 1, ?)", (legacy_code, legacy_deadline - 100))
+    lcon.commit()
+    lcon.close()
+    # 触发一次 lifespan 建表/迁移逻辑（模拟重启）：新连接执行 init_db 的等价迁移
+    from app import db as app_db  # noqa: E402
+    app_db.DB_PATH = db_path
+    app_db.init_db()
+    s, lt = req("GET", f"/api/tests/{legacy_code}/timeline?token={legacy_token}")
+    check("旧库：时间线可查 200", s == 200, str(lt))
+    check("旧库：以 history_start 标示记录起点，不虚构既往操作",
+          s == 200 and len(lt["events"]) == 1
+          and lt["events"][0]["type"] == "history_start"
+          and lt["history_complete"] is False, str(lt))
+    check("旧库：起点标记明确说明不做历史重建",
+          "不做历史重建" in lt["events"][0]["payload"]["note"]
+          or "不虚构" in lt["events"][0]["payload"]["note"],
+          str(lt["events"][0]["payload"]))
+    # 旧接口行为兼容：进度、结算冻结结果照常
+    s, lprog = req("GET", f"/api/tests/{legacy_code}?token={legacy_token}")
+    check("旧库：进度接口兼容", s == 200 and lprog["settled"] is True)
+    s, lset = req("POST", f"/api/tests/{legacy_code}/settle",
+                  {"token": legacy_token})
+    check("旧库：重复结算仍返回冻结结果", s == 200 and lset["valid_count"] == 1)
+    # 起点标记只补一次（幂等）
+    app_db.init_db()
+    s, lt2 = req("GET", f"/api/tests/{legacy_code}/timeline?token={legacy_token}")
+    check("旧库：迁移幂等，起点标记不重复",
+          sum(1 for e in lt2["events"] if e["type"] == "history_start") == 1)
+
     # --- 2.1 输入校验 ---
     s, _ = req("POST", "/api/tests", {
         "sample_a": "A1", "sample_b": "A1",
@@ -224,6 +285,86 @@ try:
     check("重复结算返回冻结结果",
           s == 200 and rep2["settled_at"] == rep["settled_at"]
           and rep2["valid_count"] == rep["valid_count"])
+
+    # --- 时间线（t2）：创建 → 5 份答卷（4 选杯 + 1 弃权，第 6 人未交）→ 结算 ---
+    s, pre = req("GET", f"/api/tests/{t2['test_code']}/timeline?token={t2['token']}")
+    check("时间线鉴权错误令牌 403",
+          req("GET", f"/api/tests/{t2['test_code']}/timeline?token=nope")[0] == 403)
+    check("不存在的测试时间线 404",
+          req("GET", "/api/tests/NOPE9999/timeline?token=x")[0] == 404)
+    # 结算前的时间线在结算前一刻取不到（现已结算）；这里改用一个未结算测试验证盲态
+    s, tl = req("GET", f"/api/tests/{t2['test_code']}/timeline?token={t2['token']}")
+    check("时间线 200", s == 200, str(tl))
+    check("时间线历史完整（无起点标记）", tl["history_complete"] is True)
+    types = [e["type"] for e in tl["events"]]
+    check("时间线类型序列 create/answer×5/settle",
+          types[0] == "create"
+          and types.count("answer") == 5
+          and types[-1] == "settle" and types.count("settle") == 1,
+          str(types))
+    check("时间线 seq 严格递增（提交顺序稳定）",
+          [e["seq"] for e in tl["events"]]
+          == sorted(e["seq"] for e in tl["events"]))
+    check("时间线 ts 单调不减（服务端时间）",
+          all(tl["events"][i]["ts"] <= tl["events"][i + 1]["ts"]
+              for i in range(len(tl["events"]) - 1)))
+    ans_ev = [e for e in tl["events"] if e["type"] == "answer"]
+    abn = [e for e in ans_ev if e["payload"]["abstained"]]
+    chk = [e for e in ans_ev if "correct" in e["payload"]]
+    check("结算后：弃权事件 answer 为 null", len(abn) == 1
+          and abn[0]["payload"].get("answer") is None, str(abn))
+    check("结算后：选杯事件透出 answer/odd_pos/odd_sample/correct",
+          len(chk) == 4
+          and all({"answer", "odd_pos", "odd_sample", "correct"}
+                  <= set(e["payload"]) for e in chk))
+    check("结算后：判定对错与实际一致（3 对 1 错）",
+          sum(1 for e in chk if e["payload"]["correct"] is True) == 3
+          and sum(1 for e in chk if e["payload"]["correct"] is False) == 1,
+          str([e["payload"]["correct"] for e in chk]))
+    sev = [e for e in tl["events"] if e["type"] == "settle"][0]
+    check("结算事件含结果与判定",
+          sev["payload"]["valid_count"] == 4
+          and sev["payload"]["correct_count"] == 3
+          and sev["payload"]["abstained_count"] == 1
+          and sev["payload"]["missing_count"] == 1
+          and sev["payload"]["distinguishable"] is False,
+          str(sev["payload"]))
+    cre = tl["events"][0]["payload"]
+    check("创建事件含样本/截止/初始名单",
+          cre["sample_a"] == "X-100" and len(cre["panelists"]) == 6
+          and all({"panelist", "code"} <= set(p) for p in cre["panelists"]),
+          str(cre))
+    # 重复结算不得产生第二条 settle 事件
+    s, tl_r = req("GET", f"/api/tests/{t2['test_code']}/timeline?token={t2['token']}")
+    check("重复结算不追加事件",
+          sum(1 for e in tl_r["events"] if e["type"] == "settle") == 1
+          and len(tl_r["events"]) == len(tl["events"]))
+
+    # 结算前盲态：另建测试，答卷后、结算前时间线不得泄露选杯/异样杯/对错
+    s, bm = req("POST", "/api/tests", {
+        "sample_a": "B-1", "sample_b": "B-2",
+        "panelists": ["b1", "b2"],
+        "deadline": int(time.time() * 1000) + 3600_000, "min_valid": 1})
+    assert s == 200
+    bm_rows = con.execute(
+        "SELECT code FROM assignments WHERE test_id="
+        "(SELECT id FROM tests WHERE code=?) ORDER BY id",
+        (bm["test_code"],)).fetchall()
+    req("POST", f"/api/eval/{bm_rows[0]['code']}/submit", {"answer": 2})
+    req("POST", f"/api/eval/{bm_rows[1]['code']}/submit", {"abstain": True})
+    s, bmt = req("GET", f"/api/tests/{bm['test_code']}/timeline?token={bm['token']}")
+    check("结算前时间线 200 且未结算", s == 200 and bmt["settled"] is False)
+    blob = json.dumps(bmt, ensure_ascii=False)
+    check("结算前不泄露选杯(answer)/异样杯/异样样本/对错",
+          '"answer":' not in blob and '"odd_pos"' not in blob
+          and '"odd_sample"' not in blob and '"correct"' not in blob, blob)
+    bm_ans = [e for e in bmt["events"] if e["type"] == "answer"]
+    check("结算前只显示已答/弃权状态",
+          len(bm_ans) == 2
+          and {e["payload"]["submitted"] for e in bm_ans} == {True}
+          and sum(1 for e in bm_ans if e["payload"]["abstained"]) == 1
+          and all("panelist" in e["payload"] for e in bm_ans),
+          str(bm_ans))
 
     # 结算后评员可见本人分配
     s, ev2 = req("GET", f"/api/eval/{rows2[0]['code']}")
@@ -479,6 +620,34 @@ try:
           and {a["panelist"] for a in exr["assignments"]}
               == {"e1", "e2", "e3", "e5"})
 
+    # 一次名单调整保留为一笔含撤回与补位明细的事件；失败操作不留任何记录
+    s, bat = req("GET", f"/api/tests/{bal['test_code']}/timeline?token={bal['token']}")
+    check("调整时间线可查", s == 200, str(bat))
+    adj_ev = [e for e in bat["events"] if e["type"] == "adjust"]
+    check("成功调整各一笔（补位1 + 撤3补2 = 2 笔）",
+          len(adj_ev) == 2, str(len(adj_ev)))
+    second = adj_ev[-1]["payload"]
+    check("调整事件同笔含撤回与补位明细",
+          len(second["withdrawn"]) == 3 and len(second["added"]) == 2
+          and second["active_total"] == 9, str(second))
+    check("调整事件撤回明细含评员与码",
+          all({"panelist", "code"} <= set(w) for w in second["withdrawn"]))
+    before_n = len(bat["events"])
+    # 触发若干必然失败的调整（409/422/404/403），均不得留下事件
+    req("POST", f"/api/tests/{bal['test_code']}/adjust",
+        {"token": bal["token"], "add_panelists": ["R1"]})          # 422 重名
+    req("POST", f"/api/tests/{bal['test_code']}/adjust",
+        {"token": bal["token"]})                                    # 422 空操作
+    req("POST", f"/api/tests/{bal['test_code']}/adjust",
+        {"token": bal["token"], "withdraw_codes": ["NOPE-NOPE"]})  # 404
+    req("POST", f"/api/tests/{bal['test_code']}/adjust",
+        {"token": "wrong", "add_panelists": ["z"]})                 # 403
+    s, bat2 = req("GET", f"/api/tests/{bal['test_code']}/timeline?token={bal['token']}")
+    check("校验失败的调整不留下任何记录",
+          len(bat2["events"]) == before_n
+          and sum(1 for e in bat2["events"] if e["type"] == "adjust") == 2,
+          f"{before_n} -> {len(bat2['events'])}")
+
     # --- 2.8 并发：同一评员码上「撤回」与「答卷」竞争，按实际先完成者判定 ---
     now_s, _ = req("GET", "/api/time")
     s, ct = req("POST", "/api/tests", {
@@ -538,6 +707,38 @@ try:
           race_ok and n_submit_win + n_withdraw_win == 20,
           f"答卷先完成 {n_submit_win} 轮，撤回先完成 {n_withdraw_win} 轮")
     check("并发过程中无 5xx 服务端错误", no_5xx)
+
+    # 并发后时间线：每个胜出方恰好一笔记录，且顺序与最终状态一致
+    s, ctt = req("GET", f"/api/tests/{ct['test_code']}/timeline?token={ct['token']}")
+    race_answers = [e for e in ctt["events"] if e["type"] == "answer"]
+    race_adjusts = [e for e in ctt["events"] if e["type"] == "adjust"]
+    check("并发：胜出答卷数与 answer 事件数一致",
+          len(race_answers) == n_submit_win,
+          f"{len(race_answers)} vs {n_submit_win}")
+    check("并发：胜出撤回数与 adjust 事件撤回明细总数一致",
+          sum(len(e["payload"]["withdrawn"]) for e in race_adjusts)
+          == n_withdraw_win,
+          str([len(e["payload"]["withdrawn"]) for e in race_adjusts]))
+    # 时间线里出现的答卷评员在库中必为 active 且已答；撤回明细中的码必为 withdrawn
+    timeline_codes_ans = {e["payload"]["code"] for e in race_answers}
+    timeline_codes_wd = {w["code"] for e in race_adjusts
+                         for w in e["payload"]["withdrawn"]}
+    state_ok = True
+    for c in timeline_codes_ans:
+        r = con.execute(
+            "SELECT status, answer FROM assignments WHERE code=?", (c,)).fetchone()
+        if not (r["status"] == "active" and r["answer"] is not None):
+            state_ok = False
+    for c in timeline_codes_wd:
+        r = con.execute(
+            "SELECT status, answer FROM assignments WHERE code=?", (c,)).fetchone()
+        if not (r["status"] == "withdrawn" and r["answer"] is None):
+            state_ok = False
+    check("并发：时间线记录与最终状态一一对应，顺序一致",
+          state_ok and timeline_codes_ans.isdisjoint(timeline_codes_wd))
+    check("并发：时间线仍按 seq 稳定排序",
+          [e["seq"] for e in ctt["events"]]
+          == sorted(e["seq"] for e in ctt["events"]))
 
     # --- 2.6 页面可达性 ---
     for path in ("/", "/admin", "/eval", f"/eval/code/{codes[0]}"):

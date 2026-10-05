@@ -11,6 +11,7 @@
 """
 
 import hashlib
+import json
 import secrets
 import time
 from contextlib import asynccontextmanager
@@ -134,6 +135,60 @@ def assignment_detail(a) -> dict:
     }
 
 
+def settlement_conclusion(frozen) -> str:
+    """结算结论文案（settle 接口与时间线 settle 事件共用，保持一致）。"""
+    if frozen["valid_count"] < frozen["min_valid"]:
+        return (
+            f"有效答卷 {frozen['valid_count']} 份，少于最少要求 "
+            f"{frozen['min_valid']} 份：样本不足，无法判定。"
+        )
+    if frozen["p_value"] is not None and frozen["p_value"] > 0.05:
+        return (
+            f"有效答卷 {frozen['valid_count']} 份、答对 {frozen['correct_count']} 份，"
+            f"单侧尾概率 p={frozen['p_value']:.4f} > 0.05：证据未达阈值，"
+            "不能判为可辨（差异不显著）。"
+        )
+    return (
+        f"有效答卷 {frozen['valid_count']} 份、答对 {frozen['correct_count']} 份，"
+        f"单侧尾概率 p={frozen['p_value']:.4f} ≤ 0.05：判为可辨。"
+    )
+
+
+def render_event(ev: dict, settled: bool, assign_by_code: dict) -> dict:
+    """把一条原始事件裁剪为负责人可见的时间线条目。
+
+    盲态规则：settled 之前，answer 事件只呈现“已答 / 弃权”，
+    不透露选杯、异样杯及对错；settled 之后才透出对应答案与判定。
+    create / adjust / settle / history_start 不含盲态答案，按原样呈现。
+    """
+    payload = json.loads(ev["payload"] or "{}")
+    item = {
+        "seq": ev["id"],
+        "ts": ev["ts"] * 1000,
+        "type": ev["type"],
+        "payload": payload,
+    }
+    if ev["type"] == "answer":
+        a = assign_by_code.get(payload.get("code"))
+        if not settled:
+            # 结算前：仅状态（已答 / 弃权），剔除选杯与判定
+            payload = {
+                "panelist": payload.get("panelist"),
+                "code": payload.get("code"),
+                "abstained": bool(payload.get("abstained")),
+                "submitted": True,
+            }
+        else:
+            payload = dict(payload)
+            if a is not None:
+                payload["odd_pos"] = a["odd_pos"]
+                payload["odd_sample"] = a["odd_sample"]
+                if not payload.get("abstained"):
+                    payload["correct"] = payload.get("answer") == a["odd_pos"]
+        item["payload"] = payload
+    return item
+
+
 # ---------------------------------------------------------------------------
 # 请求模型
 # ---------------------------------------------------------------------------
@@ -176,7 +231,7 @@ async def lifespan(app: FastAPI):
     yield
 
 
-app = FastAPI(title="三角嗅辨盲评工作台", version="1.1", lifespan=lifespan)
+app = FastAPI(title="三角嗅辨盲评工作台", version="1.2", lifespan=lifespan)
 
 
 @app.exception_handler(HTTPException)
@@ -221,21 +276,33 @@ def create_test(body: TestCreate):
     token = new_code(16)
 
     with db.write_tx() as conn:
+        ts = now_ts()
         cur = conn.execute(
             """INSERT INTO tests
                (code, token_hash, sample_a, sample_b, deadline, min_valid, created_at)
                VALUES (?, ?, ?, ?, ?, ?, ?)""",
             (test_code, hash_token(test_code, token),
-             sample_a, sample_b, deadline, body.min_valid, now_ts()),
+             sample_a, sample_b, deadline, body.min_valid, ts),
         )
         test_id = cur.lastrowid
+        initial = []
         for name, (odd_pos, odd_sample) in zip(names, assign_cups(len(names))):
+            pcode = new_code(10)
             conn.execute(
                 """INSERT INTO assignments
                    (test_id, panelist, code, odd_pos, odd_sample)
                    VALUES (?, ?, ?, ?, ?)""",
-                (test_id, name, new_code(10), odd_pos, odd_sample),
+                (test_id, name, pcode, odd_pos, odd_sample),
             )
+            initial.append({"panelist": name, "code": pcode})
+        # 创建事件与测试、名单同一事务提交
+        db.log_event(conn, test_id, ts, "create", {
+            "sample_a": sample_a,
+            "sample_b": sample_b,
+            "deadline": deadline * 1000,
+            "min_valid": body.min_valid,
+            "panelists": initial,
+        })
 
     return {
         "test_code": test_code,
@@ -340,6 +407,7 @@ def submit(code: str, body: SubmitAnswer):
         raise HTTPException(status_code=422, detail="请选择异样杯位置或选择弃权")
 
     with db.write_tx() as conn:
+        ts = now_ts()
         a = conn.execute(
             "SELECT a.*, t.deadline FROM assignments a "
             "JOIN tests t ON a.test_id = t.id "
@@ -350,14 +418,21 @@ def submit(code: str, body: SubmitAnswer):
             raise HTTPException(status_code=404, detail="盲评码无效")
         if a["answer"] is not None:
             raise HTTPException(status_code=409, detail="该盲评码已提交，答卷不可修改")
-        if now_ts() >= a["deadline"]:
+        if ts >= a["deadline"]:
             raise HTTPException(status_code=403, detail="已过截止时间，答卷被拒绝")
 
         value = ABSTAIN if body.abstain else body.answer
         conn.execute(
             "UPDATE assignments SET answer=?, answered_at=? WHERE id=?",
-            (value, now_ts(), a["id"]),
+            (value, ts, a["id"]),
         )
+        # 答卷事件与状态变更同事务；结算前只存不泄，读取时再按盲态裁剪
+        db.log_event(conn, a["test_id"], ts, "answer", {
+            "panelist": a["panelist"],
+            "code": a["code"],
+            "abstained": bool(body.abstain),
+            "answer": None if body.abstain else body.answer,
+        })
     return {"ok": True, "answer": "弃权" if body.abstain else body.answer}
 
 
@@ -388,6 +463,8 @@ def settle(test_code: str, body: AdminAction):
                 1 for a in assigns
                 if a["answer"] not in (None, ABSTAIN) and a["answer"] == a["odd_pos"]
             )
+            abstained = sum(1 for a in assigns if a["answer"] == ABSTAIN)
+            missing = sum(1 for a in assigns if a["answer"] is None)
             p = binomial_tail(valid, correct)
             distinguishable = int(valid >= row["min_valid"] and p <= 0.05)
             conn.execute(
@@ -395,6 +472,16 @@ def settle(test_code: str, body: AdminAction):
                    p_value=?, distinguishable=? WHERE id=?""",
                 (ts, valid, correct, p, distinguishable, row["id"]),
             )
+            # 结算事件与状态冻结同一事务提交
+            db.log_event(conn, row["id"], ts, "settle", {
+                "valid_count": valid,
+                "correct_count": correct,
+                "abstained_count": abstained,
+                "missing_count": missing,
+                "p_value": p,
+                "min_valid": row["min_valid"],
+                "distinguishable": bool(distinguishable),
+            })
             frozen = conn.execute(
                 "SELECT * FROM tests WHERE id = ?", (row["id"],)
             ).fetchone()
@@ -404,23 +491,6 @@ def settle(test_code: str, body: AdminAction):
             "ORDER BY id",
             (row["id"], ACTIVE),
         ).fetchall()
-
-    if frozen["valid_count"] < frozen["min_valid"]:
-        conclusion = (
-            f"有效答卷 {frozen['valid_count']} 份，少于最少要求 "
-            f"{frozen['min_valid']} 份：样本不足，无法判定。"
-        )
-    elif frozen["p_value"] is not None and frozen["p_value"] > 0.05:
-        conclusion = (
-            f"有效答卷 {frozen['valid_count']} 份、答对 {frozen['correct_count']} 份，"
-            f"单侧尾概率 p={frozen['p_value']:.4f} > 0.05：证据未达阈值，"
-            "不能判为可辨（差异不显著）。"
-        )
-    else:
-        conclusion = (
-            f"有效答卷 {frozen['valid_count']} 份、答对 {frozen['correct_count']} 份，"
-            f"单侧尾概率 p={frozen['p_value']:.4f} ≤ 0.05：判为可辨。"
-        )
 
     return {
         "test_code": frozen["code"],
@@ -435,7 +505,7 @@ def settle(test_code: str, body: AdminAction):
         "p_value": frozen["p_value"],
         "min_valid": frozen["min_valid"],
         "distinguishable": bool(frozen["distinguishable"]),
-        "conclusion": conclusion,
+        "conclusion": settlement_conclusion(frozen),
         "assignments": [assignment_detail(a) for a in assigns],
     }
 
@@ -590,6 +660,16 @@ def adjust_roster(test_code: str, body: AdjustRoster):
             (row["id"], ACTIVE),
         ).fetchall()
 
+        # 一次名单调整仅保留一笔事件（撤回与补位同在此明细内），与名单变更同事务
+        db.log_event(conn, row["id"], now_ts(), "adjust", {
+            "withdrawn": [
+                {"panelist": a["panelist"], "code": a["code"]}
+                for a in withdrawn_rows
+            ],
+            "added": added,
+            "active_total": len(active_rows),
+        })
+
     submitted = sum(1 for a in active_rows if a["answer"] is not None)
     abstained = sum(1 for a in active_rows if a["answer"] == ABSTAIN)
     valid_answers = sum(
@@ -609,6 +689,46 @@ def adjust_roster(test_code: str, body: AdjustRoster):
             "abstained": abstained,
             "valid": valid_answers,
         },
+    }
+
+
+# ---------------------------------------------------------------------------
+# 操作时间线（仅实验负责人凭管理凭证可查）
+# ---------------------------------------------------------------------------
+
+@app.get("/api/tests/{test_code}/timeline")
+def timeline(test_code: str, token: str):
+    """按提交顺序返回一场实验从创建到结算的操作时间线。
+
+    - 鉴权与进度接口一致（测试码 + 负责人令牌）。
+    - 条目按 events.id（写事务提交顺序）稳定升序；ts 为事务内采集的服务端时间。
+    - 结算前 answer 事件只含已答/弃权状态；结算后才透出选杯、异样杯、异样样本与对错。
+    - 旧数据库缺少既往操作时以 history_start 条目标示记录起点，不虚构历史。
+    """
+    row = require_admin(test_code, token)
+    conn = db.read_conn()
+    try:
+        events = conn.execute(
+            "SELECT id, ts, type, payload FROM events WHERE test_id = ? "
+            "ORDER BY id",
+            (row["id"],),
+        ).fetchall()
+        assigns = conn.execute(
+            "SELECT code, odd_pos, odd_sample FROM assignments WHERE test_id = ?",
+            (row["id"],),
+        ).fetchall()
+    finally:
+        conn.close()
+
+    settled = row["settled_at"] is not None
+    assign_by_code = {a["code"]: a for a in assigns}
+    return {
+        "test_code": row["code"],
+        "settled": settled,
+        "now": now_ts() * 1000,
+        # 存在 history_start 标记表示该测试既往操作无法追溯（旧库升级）
+        "history_complete": all(e["type"] != "history_start" for e in events),
+        "events": [render_event(e, settled, assign_by_code) for e in events],
     }
 
 

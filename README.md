@@ -30,6 +30,17 @@
      任一校验失败则**整次操作无效**（事务回滚，不留中间态）；
    - 截止或结算后一律拒绝调整；与答卷并发时按**实际先完成**的操作判定
      （答卷先完成则撤回报「已作答」，撤回先完成则旧码立即失效、答卷按 404 拒绝）。
+8. **操作时间线（可追溯审计）**：实验负责人凭测试码 + 管理令牌调用
+   `GET /api/tests/{code}/timeline` 即可按**提交顺序**取得一场实验从创建到结算的
+   实际变动：创建、名单调整（撤回 + 补位在同一笔明细内）、评员答卷 / 弃权、结算形成。
+   - 每条记录含**服务端时间**（事务内采集）、**操作类型**、**关联评员**与结果，
+     以自增序号 `seq` 稳定升序；答卷 / 调整 / 结算的记录与状态变更在**同一写事务**内
+     原子提交，校验失败整笔回滚、**不留下记录**，并发时顺序与最终状态一致；
+   - **结算前**答卷记录只显示「已答 / 弃权」，不透露选杯、异样杯（位置 / 样本）与对错；
+     **结算后**同一条记录才可查看对应答案与判定；
+   - 升级前由旧版本创建的测试没有既往操作记录，时间线首条为 **`history_start`
+     记录起点标记**（响应中 `history_complete=false`），明确说明既往操作不可追溯，
+     **不虚构历史**；升级后新建测试 `history_complete=true`、记录完整。
 
 **评员**
 
@@ -41,6 +52,7 @@
 截止判定一律以**服务端时钟**为准——临界时刻要么答卷落入截止前、要么按截止后拒绝；
 撤回与答卷竞争同一评员时，先拿到写锁并完成的一方生效；
 结算一旦写入即冻结，不会被后续操作改动。
+操作时间线的记录就在这些同一事务内落库，提交顺序（`seq`）与最终状态严格一致。
 
 ## 一键启动（Docker Compose，推荐）
 
@@ -101,7 +113,8 @@ uvicorn app.main:app --host 0.0.0.0 --port 8080
 
 测试仅依赖 Python 标准库，会启动真实 uvicorn 子进程走完整 HTTP 流程
 （统计函数交叉验证、输入校验、盲态保密、一次提交、截止拒答、结算判定、冻结、回看、
-撤回/补位、均衡再分配、有效人数上下限、撤回与答卷并发竞争）：
+撤回/补位、均衡再分配、有效人数上下限、撤回与答卷并发竞争、操作时间线的顺序/盲态/
+原子性/并发一致性，以及旧数据库升级的记录起点标记）：
 
 ```bash
 pip install -r requirements.txt
@@ -116,6 +129,7 @@ python tests/smoke_test.py
 | GET  | `/api/tests/{code}?token=` | 负责人进度（截止前仅汇总计数 + 分发链接） |
 | POST | `/api/tests/{code}/adjust` | 截止前撤回盲评码 / 补位评员（可单用或合用） |
 | POST | `/api/tests/{code}/settle` | 截止后结算（重复调用返回冻结结果） |
+| GET  | `/api/tests/{code}/timeline?token=` | 负责人操作时间线（结算后才透出选杯与对错） |
 | GET  | `/api/eval/{code}` | 评员视图（结算前无任何分配/样本信息） |
 | POST | `/api/eval/{code}/submit` | 提交 `{"answer":1|2|3}` 或 `{"abstain":true}` |
 | GET  | `/api/time` | 服务端当前时间（毫秒） |
@@ -181,6 +195,64 @@ curl -X POST http://localhost:8080/api/tests/AbCdEf12/adjust \
 
 管理台页面（`/admin`）在截止前也提供「名单调整」卡片，支持按行粘贴盲评码与姓名直接操作。
 
+### 操作时间线接口调用示例
+
+`GET /api/tests/{test_code}/timeline?token=负责人令牌`（仅该实验负责人可查询，
+令牌错误 403、测试不存在 404）：
+
+```bash
+curl "http://localhost:8080/api/tests/AbCdEf12/timeline?token=负责人令牌"
+```
+
+响应（事件按 `seq` 即写事务提交顺序稳定排列，`ts` 为服务端毫秒时间）：
+
+```json
+{
+  "test_code": "AbCdEf12",
+  "settled": false,
+  "now": 1759000000000,
+  "history_complete": true,
+  "events": [
+    {"seq": 1, "ts": 1758999000000, "type": "create", "payload": {
+        "sample_a": "茉莉", "sample_b": "玫瑰", "deadline": 1759002600000,
+        "min_valid": 3,
+        "panelists": [{"panelist": "张三", "code": "kPq7mWx2Za"}]}},
+    {"seq": 2, "ts": 1758999300000, "type": "answer", "payload": {
+        "panelist": "张三", "code": "kPq7mWx2Za",
+        "abstained": false, "submitted": true}},
+    {"seq": 3, "ts": 1758999400000, "type": "adjust", "payload": {
+        "withdrawn": [{"panelist": "李四", "code": "nR4tYv8QbC"}],
+        "added": [{"panelist": "赵六", "code": "A2bcDeFGhJ",
+                   "url": "/eval/code/A2bcDeFGhJ"}],
+        "active_total": 3}}
+  ]
+}
+```
+
+**盲态规则**：`settled=false` 时，`answer` 事件只有 `submitted/abstained` 状态，
+**不含** `answer / odd_pos / odd_sample / correct`；`settled=true` 后同一时间线中
+这些字段才会透出（弃权事件 `answer` 为 `null` 且不判定对错）：
+
+```json
+{"seq": 2, "ts": 1758999300000, "type": "answer", "payload": {
+    "panelist": "张三", "code": "kPq7mWx2Za", "abstained": false,
+    "answer": 2, "odd_pos": 2, "odd_sample": "B", "correct": true}}
+```
+
+事件类型：
+
+| type | 含义 | 关键字段 |
+| --- | --- | --- |
+| `create` | 实验创建（与测试同事务） | 样本编号、截止、最少有效数、初始名单（评员 + 盲评码） |
+| `answer` | 评员答卷 / 弃权（与答卷状态同事务） | 关联评员与盲评码；结算后才有选杯、异样杯、异样样本、对错 |
+| `adjust` | 一次名单调整（撤回 + 补位同在一笔明细） | `withdrawn[]`、`added[]`、调整后有效人数 |
+| `settle` | 结算形成（与冻结状态同事务；重复结算不追加） | 有效 / 答对 / 弃权 / 未交数、p 值、判定 |
+| `history_start` | 旧库升级后的记录起点标记 | `note` 说明既往操作不可追溯、`legacy_created_at` |
+
+原子性：答卷、调整、结算的业务状态与对应事件在同一个 `BEGIN IMMEDIATE` 事务中提交，
+任一校验失败整体回滚，时间线不会出现半截记录；并发操作以实际先拿到写锁并提交者为准，
+事件 `seq` 顺序与数据库最终状态一致。
+
 ## 安全与使用注意
 
 - **负责人令牌只在创建测试时返回一次**，请立即保存；它与测试码共同构成管理凭证（服务端只存 SHA-256 哈希）。
@@ -192,8 +264,8 @@ curl -X POST http://localhost:8080/api/tests/AbCdEf12/adjust \
 
 ```
 app/
-  main.py        # FastAPI 路由与业务逻辑
-  db.py          # SQLite 连接、建表、写事务
+  main.py        # FastAPI 路由与业务逻辑（含操作时间线接口）
+  db.py          # SQLite 连接、建表、写事务、事件写入与旧库起点标记
   stats.py       # 二项分布单侧尾概率
 static/
   index.html     # 负责人首页：创建 / 进入
