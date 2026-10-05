@@ -104,6 +104,13 @@ function render(t) {
             </tr>`).join('')}
         </tbody>
       </table>
+    </div>
+
+    <div class="card">
+      <h2>操作时间线</h2>
+      <p class="hint">创建、名单调整、答卷/弃权与结算按提交顺序逐笔记录（服务端时间）。
+        结算前答卷只显示「已作答 / 已弃权」，结算后才显示选杯与判定。</p>
+      <div id="timeline"><p class="small">加载中…</p></div>
     </div>`;
 
   clearInterval(timer);
@@ -121,6 +128,80 @@ function render(t) {
   const adjustBtn = document.getElementById('adjustBtn');
   if (adjustBtn) adjustBtn.addEventListener('click', doAdjust);
   if (t.settled) doSettle();
+  loadTimeline();
+}
+
+const EVENT_LABELS = {
+  created: '创建实验',
+  roster_adjusted: '名单调整',
+  answer: '提交答卷',
+  abstain: '弃权',
+  settled: '结算',
+  recording_started: '记录起点',
+};
+
+function eventDetail(ev) {
+  const d = ev.detail || {};
+  switch (ev.type) {
+    case 'created':
+      return `样本 A「${esc(d.sample_a)}」/ B「${esc(d.sample_b)}」，` +
+        `${d.panelist_count} 名评员，截止 ${fmtTime(d.deadline)}，` +
+        `最少有效 ${d.min_valid} 份`;
+    case 'roster_adjusted': {
+      const parts = [];
+      if (d.withdrawn && d.withdrawn.length)
+        parts.push('撤回：' + d.withdrawn.map(x => `${esc(x.panelist)}（旧码 ${esc(x.code)}）`).join('、'));
+      if (d.added && d.added.length)
+        parts.push('补位：' + d.added.map(x => `${esc(x.panelist)}（新码 ${esc(x.code)}）`).join('、'));
+      parts.push(`调整后有效名单 ${d.active_count} 人`);
+      return parts.join('；');
+    }
+    case 'answer':
+      return d.answer === undefined
+        ? '已作答（结算前不公开选杯与判定）'
+        : `选 ${d.answer} 号杯 · ${d.correct ? '<span class="badge ok">答对</span>' : '<span class="badge no">答错</span>'}`;
+    case 'abstain':
+      return '已弃权';
+    case 'settled':
+      return `有效 ${d.valid_count} / 答对 ${d.correct_count} / 弃权 ${d.abstained_count} / ` +
+        `未交 ${d.missing_count}，p=${d.p_value === null ? '—' : Number(d.p_value).toFixed(4)}，` +
+        (d.distinguishable ? '<span class="badge ok">判为可辨</span>' : '<span class="badge no">不可判为可辨</span>');
+    case 'recording_started':
+      return esc(d.note || '此前操作无记录，时间线自此开始');
+    default:
+      return '';
+  }
+}
+
+async function loadTimeline() {
+  const el = document.getElementById('timeline');
+  if (!el) return;
+  try {
+    const r = await api(`/api/tests/${encodeURIComponent(code)}/timeline?token=${encodeURIComponent(token)}`);
+    if (!r.events.length) {
+      el.innerHTML = '<p class="small">暂无记录。</p>';
+      return;
+    }
+    const incomplete = r.history_complete ? '' : `
+      <div class="callout warn">该实验创建于时间线功能上线前，既往操作无逐笔记录；
+        下方自「记录起点」开始，之前的历史未被虚构补全。</div>`;
+    el.innerHTML = incomplete + `
+      <table>
+        <thead><tr><th>#</th><th>服务端时间</th><th>操作</th><th>评员</th><th>结果 / 明细</th></tr></thead>
+        <tbody>
+          ${r.events.map(ev => `
+            <tr>
+              <td>${ev.seq}</td>
+              <td class="small">${fmtTime(ev.at)}</td>
+              <td>${EVENT_LABELS[ev.type] || esc(ev.type)}</td>
+              <td>${ev.panelist ? esc(ev.panelist) : '—'}</td>
+              <td class="small">${eventDetail(ev)}</td>
+            </tr>`).join('')}
+        </tbody>
+      </table>`;
+  } catch (err) {
+    el.innerHTML = `<div class="callout err">时间线加载失败：${esc(err.message)}</div>`;
+  }
 }
 
 async function doAdjust() {
@@ -171,6 +252,7 @@ async function doSettle() {
     });
     renderReport(r);
     if (btn) { btn.disabled = true; btn.textContent = '已结算（结果已冻结）'; }
+    loadTimeline();  // 结算事件入列，答卷事件解锁答案与判定
   } catch (err) {
     showErr(msgEl, err.message);
     if (btn) { btn.disabled = false; btn.textContent = '立即结算'; }

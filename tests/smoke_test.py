@@ -230,6 +230,52 @@ try:
     check("结算后评员可回看 odd_pos", ev2.get("odd_pos") == rows2[0]["odd_pos"])
     check("结算后评员可见样本编号", ev2.get("sample_a") == "X-100")
 
+    # --- 2.3.1 操作时间线：结算后完整可见、顺序稳定、重复结算不重复记录 ---
+    s, tl = req("GET", f"/api/tests/{t2['test_code']}/timeline?token={t2['token']}")
+    check("时间线查询 200", s == 200, str(tl))
+    evs = tl["events"]
+    check("时间线 7 笔：创建+4答卷+1弃权+结算（未交/重复提交/截止后拒答无记录）",
+          len(evs) == 7, str([e["type"] for e in evs]))
+    check("时间线 seq 从 1 起连续递增（按提交顺序稳定排列）",
+          [e["seq"] for e in evs] == list(range(1, 8)))
+    check("时间线首笔为创建、末笔为结算",
+          evs[0]["type"] == "created" and evs[-1]["type"] == "settled")
+    check("创建事件含样本、名单规模与截止",
+          evs[0]["detail"]["sample_a"] == "X-100"
+          and evs[0]["detail"]["panelist_count"] == 6
+          and evs[0]["detail"]["min_valid"] == 6
+          and evs[0]["detail"]["deadline"] > 0)
+    ans_evs = [e for e in evs if e["type"] == "answer"]
+    check("结算后答卷事件显示答案与判定",
+          len(ans_evs) == 4
+          and all(isinstance(e["detail"].get("answer"), int)
+                  and isinstance(e["detail"].get("correct"), bool)
+                  for e in ans_evs), str(ans_evs))
+    check("答卷事件判定与实际一致（3 对 1 错）",
+          sum(1 for e in ans_evs if e["detail"]["correct"]) == 3)
+    ab_evs = [e for e in evs if e["type"] == "abstain"]
+    check("弃权事件关联评员「戊」",
+          len(ab_evs) == 1 and ab_evs[0]["panelist"] == "戊", str(ab_evs))
+    stl = evs[-1]["detail"]
+    check("结算事件含结果统计与判定",
+          stl["valid_count"] == 4 and stl["correct_count"] == 3
+          and stl["abstained_count"] == 1 and stl["missing_count"] == 1
+          and stl["distinguishable"] is False, str(stl))
+    check("时间线事件带服务端毫秒时间",
+          all(isinstance(e["at"], int) and e["at"] > 0 for e in evs))
+    check("新库实验历史完整（无记录起点标记）",
+          tl["history_complete"] is True)
+    # 重复结算返回冻结结果，但不新增时间线事件
+    s, _ = req("POST", f"/api/tests/{t2['test_code']}/settle",
+               {"token": t2["token"]})
+    s, tl2 = req("GET", f"/api/tests/{t2['test_code']}/timeline?token={t2['token']}")
+    check("重复结算后时间线仍 7 笔", len(tl2["events"]) == 7)
+    # 时间线鉴权：仅负责人凭管理令牌可查
+    s, _ = req("GET", f"/api/tests/{t2['test_code']}/timeline?token=wrong")
+    check("时间线错误令牌 403", s == 403)
+    s, _ = req("GET", "/api/tests/NOPE-NOPE/timeline?token=x")
+    check("时间线未知测试 404", s == 404)
+
     # --- 2.4 显著场景：min_valid=4，4 人全对 → p=(1/3)^4≈0.0123 → 可辨 ---
     s, t3 = req("POST", "/api/tests", {
         "sample_a": "K-1", "sample_b": "K-2",
@@ -349,6 +395,24 @@ try:
     check("已弃权者不可撤回 (409)", st == 409 and "已弃权" in b2["detail"],
           str(b2))
 
+    # 结算前时间线：答卷只显示已答/弃权，不泄露选杯、异样杯与对错
+    s, awl = req("GET", f"/api/tests/{aw['test_code']}/timeline?token={aw['token']}")
+    check("结算前时间线 200", s == 200)
+    aw_evs = awl["events"]
+    check("结算前时间线 3 笔（创建+答卷+弃权）",
+          [e["type"] for e in aw_evs] == ["created", "answer", "abstain"],
+          str([e["type"] for e in aw_evs]))
+    check("结算前答卷事件只有「已作答」，无答案与对错",
+          aw_evs[1]["detail"] == {"result": "answered"}, str(aw_evs[1]))
+    check("结算前弃权事件只有「已弃权」",
+          aw_evs[2]["detail"] == {"result": "abstained"}, str(aw_evs[2]))
+    aw_leak = json.dumps(awl, ensure_ascii=False)
+    check("结算前时间线无任何答案/对错/异样杯泄露",
+          '"correct"' not in aw_leak and "odd_pos" not in aw_leak
+          and "odd_sample" not in aw_leak)
+    check("结算前答卷/弃权事件均关联评员",
+          aw_evs[1]["panelist"] == "w1" and aw_evs[2]["panelist"] == "w2")
+
     # 姓名不得重用（与有效名单、已撤回者都冲突）
     st, b3 = req("POST", f"/api/tests/{bal['test_code']}/adjust",
                  {"token": bal["token"], "add_panelists": ["R1"]})
@@ -373,6 +437,30 @@ try:
     st, b9 = req("POST", f"/api/tests/{bal['test_code']}/adjust",
                  {"token": "wrong", "add_panelists": ["x"]})
     check("调整接口错误令牌 403", st == 403)
+
+    # 时间线：一次调整记为一笔含撤回与补位明细；失败操作一律不留记录
+    s, btl = req("GET", f"/api/tests/{bal['test_code']}/timeline?token={bal['token']}")
+    check("调整时间线 200", s == 200)
+    b_evs = btl["events"]
+    check("时间线 3 笔（创建+两次成功调整），全部失败调整无记录",
+          [e["type"] for e in b_evs] == ["created", "roster_adjusted",
+                                         "roster_adjusted"],
+          str([e["type"] for e in b_evs]))
+    adj1 = b_evs[1]["detail"]
+    check("只补位调整：一笔事件含补位明细",
+          adj1["withdrawn"] == [] and len(adj1["added"]) == 1
+          and adj1["added"][0]["panelist"] == "P9"
+          and adj1["added"][0]["code"] and adj1["active_count"] == 10,
+          str(adj1))
+    adj2 = b_evs[2]["detail"]
+    check("撤回并补位调整：一笔事件含两侧明细",
+          len(adj2["withdrawn"]) == 3 and len(adj2["added"]) == 2
+          and {x["panelist"] for x in adj2["added"]} == {"R1", "R2"}
+          and all(x["code"] for x in adj2["withdrawn"])
+          and adj2["active_count"] == 9, str(adj2))
+    check("调整事件明细不含异样杯位置/异样样本",
+          all("odd_pos" not in json.dumps(e) and "odd_sample" not in json.dumps(e)
+              for e in b_evs))
 
     # 下限：新建 min_valid=4 的 4 人测试，撤回 1 人 → 3 < 4，整次操作无效
     s, mn = req("POST", "/api/tests", {
@@ -552,6 +640,149 @@ finally:
     except subprocess.TimeoutExpired:
         proc.kill()
     server_log.close()
+
+
+# ---------------------------------------------------------------------------
+# 3. 旧库迁移：既往实验标示记录起点，不虚构历史；新操作接续记录
+# ---------------------------------------------------------------------------
+
+import hashlib  # noqa: E402
+
+legacy_db = os.path.join(tmpdir, "legacy.db")
+lcon = sqlite3.connect(legacy_db)
+# 模拟时间线功能上线前的旧库：有 tests/assignments，无 events 表
+lcon.executescript("""
+CREATE TABLE tests (
+    id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+    code               TEXT NOT NULL UNIQUE,
+    token_hash         TEXT NOT NULL,
+    sample_a           TEXT NOT NULL,
+    sample_b           TEXT NOT NULL,
+    deadline           INTEGER NOT NULL,
+    min_valid          INTEGER NOT NULL,
+    created_at         INTEGER NOT NULL,
+    settled_at         INTEGER,
+    valid_count        INTEGER,
+    correct_count      INTEGER,
+    p_value            REAL,
+    distinguishable    INTEGER
+);
+CREATE TABLE assignments (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    test_id      INTEGER NOT NULL REFERENCES tests(id),
+    panelist     TEXT NOT NULL,
+    code         TEXT NOT NULL UNIQUE,
+    odd_pos      INTEGER NOT NULL,
+    odd_sample   TEXT NOT NULL,
+    answer       INTEGER,
+    answered_at  INTEGER,
+    status       TEXT NOT NULL DEFAULT 'active',
+    UNIQUE(test_id, panelist)
+);
+""")
+legacy_token = "legacy-token-123"
+legacy_hash = hashlib.sha256(f"LEGACY01:{legacy_token}".encode()).hexdigest()
+now_s = int(time.time())
+lcon.execute(
+    "INSERT INTO tests (code, token_hash, sample_a, sample_b, deadline,"
+    " min_valid, created_at) VALUES (?,?,?,?,?,?,?)",
+    ("LEGACY01", legacy_hash, "LA", "LB", now_s + 3600, 1, now_s - 100))
+lcon.execute("INSERT INTO assignments (test_id, panelist, code, odd_pos,"
+             " odd_sample) VALUES (1, '老甲', 'LEGACYAAAA', 1, 'A')")
+lcon.execute("INSERT INTO assignments (test_id, panelist, code, odd_pos,"
+             " odd_sample) VALUES (1, '老乙', 'LEGACYBBBB', 2, 'B')")
+lcon.commit()
+lcon.close()
+
+from app import db as appdb  # noqa: E402
+
+appdb.DB_PATH = legacy_db
+appdb.init_db()
+appdb.init_db()  # 重复启动（如容器重启）不得重复补记录
+lcon = sqlite3.connect(legacy_db)
+lcon.row_factory = sqlite3.Row
+lev = lcon.execute("SELECT * FROM events ORDER BY id").fetchall()
+check("旧库迁移：为既往实验补一条「记录起点」事件且幂等",
+      len(lev) == 1 and lev[0]["type"] == "recording_started"
+      and lev[0]["seq"] == 1, str([dict(e) for e in lev]))
+check("旧库迁移：不虚构创建/答卷/调整/结算等历史事件",
+      all(e["type"] == "recording_started" for e in lev))
+lcon.close()
+
+fresh_db = os.path.join(tmpdir, "fresh.db")
+appdb.DB_PATH = fresh_db
+appdb.init_db()
+fcon = sqlite3.connect(fresh_db)
+check("全新库（无既往实验）不补记录起点",
+      fcon.execute("SELECT COUNT(*) AS c FROM events").fetchone()[0] == 0)
+fcon.close()
+
+# HTTP 级：以旧库启动服务，验证时间线端点标示记录起点、新操作接续记录
+port2 = 8000 + (uuid.uuid4().int % 1000)
+if port2 == port:
+    port2 += 1
+base2 = f"http://127.0.0.1:{port2}"
+server_log2 = open(os.path.join(tmpdir, "server2.log"), "w")
+proc2 = subprocess.Popen(
+    [sys.executable, "-m", "uvicorn", "app.main:app",
+     "--host", "127.0.0.1", "--port", str(port2), "--workers", "1"],
+    cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    env=dict(os.environ, SNIFF_DB_PATH=legacy_db),
+    stdout=server_log2, stderr=subprocess.STDOUT, text=True,
+)
+
+
+def req2(method, path, body=None):
+    data = json.dumps(body).encode() if body is not None else None
+    r = urllib.request.Request(base2 + path, data=data, method=method,
+                               headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(r, timeout=10) as resp:
+            return resp.status, json.loads(resp.read().decode())
+    except urllib.error.HTTPError as e:
+        return e.code, json.loads(e.read().decode())
+
+
+try:
+    last_err = None
+    for _ in range(50):
+        try:
+            urllib.request.urlopen(base2 + "/api/time", timeout=2)
+            break
+        except Exception as exc:  # noqa: BLE001
+            last_err = exc
+            time.sleep(0.2)
+    else:
+        raise RuntimeError(f"旧库服务未启动: {last_err!r}")
+
+    s, ltl = req2("GET", f"/api/tests/LEGACY01/timeline?token={legacy_token}")
+    check("旧库实验时间线 200", s == 200, str(ltl))
+    check("旧库时间线仅含记录起点，明确标示历史不完整",
+          len(ltl["events"]) == 1
+          and ltl["events"][0]["type"] == "recording_started"
+          and ltl["history_complete"] is False, str(ltl))
+    check("记录起点事件带说明文字与服务端时间",
+          bool(ltl["events"][0]["detail"].get("note"))
+          and ltl["events"][0]["at"] > 0)
+
+    # 旧实验的新操作正常接续记录（seq 从起点之后递增）
+    s, _ = req2("POST", "/api/eval/LEGACYAAAA/submit", {"answer": 1})
+    check("旧库实验新答卷 200", s == 200)
+    s, ltl2 = req2("GET", f"/api/tests/LEGACY01/timeline?token={legacy_token}")
+    check("新操作接续记录（起点 seq=1 → 答卷 seq=2）",
+          [e["type"] for e in ltl2["events"]] == ["recording_started", "answer"]
+          and [e["seq"] for e in ltl2["events"]] == [1, 2], str(ltl2["events"]))
+    check("旧库实验结算前答卷同样保密",
+          ltl2["events"][1]["detail"] == {"result": "answered"})
+    s, _ = req2("GET", "/api/eval/LEGACYBBBB")
+    check("旧库评员视图兼容可用", s == 200)
+finally:
+    proc2.terminate()
+    try:
+        proc2.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        proc2.kill()
+    server_log2.close()
 
 print()
 if FAILS:

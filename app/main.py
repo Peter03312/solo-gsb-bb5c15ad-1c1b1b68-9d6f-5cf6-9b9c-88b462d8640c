@@ -11,6 +11,7 @@
 """
 
 import hashlib
+import json
 import secrets
 import time
 from contextlib import asynccontextmanager
@@ -176,7 +177,7 @@ async def lifespan(app: FastAPI):
     yield
 
 
-app = FastAPI(title="三角嗅辨盲评工作台", version="1.1", lifespan=lifespan)
+app = FastAPI(title="三角嗅辨盲评工作台", version="1.2", lifespan=lifespan)
 
 
 @app.exception_handler(HTTPException)
@@ -236,6 +237,13 @@ def create_test(body: TestCreate):
                    VALUES (?, ?, ?, ?, ?)""",
                 (test_id, name, new_code(10), odd_pos, odd_sample),
             )
+        db.log_event(conn, test_id, "created", payload={
+            "sample_a": sample_a,
+            "sample_b": sample_b,
+            "panelist_count": len(names),
+            "deadline": deadline * 1000,
+            "min_valid": body.min_valid,
+        })
 
     return {
         "test_code": test_code,
@@ -358,6 +366,13 @@ def submit(code: str, body: SubmitAnswer):
             "UPDATE assignments SET answer=?, answered_at=? WHERE id=?",
             (value, now_ts(), a["id"]),
         )
+        # 事件与答卷同事务提交；答案与判定仅供结算后回看，结算前输出会被过滤
+        if body.abstain:
+            db.log_event(conn, a["test_id"], "abstain", panelist=a["panelist"])
+        else:
+            db.log_event(conn, a["test_id"], "answer", panelist=a["panelist"],
+                         payload={"answer": value,
+                                  "correct": bool(value == a["odd_pos"])})
     return {"ok": True, "answer": "弃权" if body.abstain else body.answer}
 
 
@@ -395,6 +410,18 @@ def settle(test_code: str, body: AdminAction):
                    p_value=?, distinguishable=? WHERE id=?""",
                 (ts, valid, correct, p, distinguishable, row["id"]),
             )
+            # 结算结果与事件同事务提交；重复结算走上面的冻结分支，不再记录
+            db.log_event(conn, row["id"], "settled", payload={
+                "valid_count": valid,
+                "correct_count": correct,
+                "abstained_count": sum(
+                    1 for a in assigns if a["answer"] == ABSTAIN),
+                "missing_count": sum(
+                    1 for a in assigns if a["answer"] is None),
+                "p_value": p,
+                "min_valid": row["min_valid"],
+                "distinguishable": bool(distinguishable),
+            })
             frozen = conn.execute(
                 "SELECT * FROM tests WHERE id = ?", (row["id"],)
             ).fetchone()
@@ -590,6 +617,19 @@ def adjust_roster(test_code: str, body: AdjustRoster):
             (row["id"], ACTIVE),
         ).fetchall()
 
+        # 一次调整记为一笔事件，含撤回与补位全部明细；
+        # 此前任一校验失败都会回滚整个事务，不会留下事件
+        db.log_event(conn, row["id"], "roster_adjusted", payload={
+            "withdrawn": [
+                {"panelist": a["panelist"], "code": a["code"]}
+                for a in withdrawn_rows
+            ],
+            "added": [
+                {"panelist": x["panelist"], "code": x["code"]} for x in added
+            ],
+            "active_count": len(active_rows),
+        })
+
     submitted = sum(1 for a in active_rows if a["answer"] is not None)
     abstained = sum(1 for a in active_rows if a["answer"] == ABSTAIN)
     valid_answers = sum(
@@ -609,6 +649,62 @@ def adjust_roster(test_code: str, body: AdjustRoster):
             "abstained": abstained,
             "valid": valid_answers,
         },
+    }
+
+
+# ---------------------------------------------------------------------------
+# 操作时间线（负责人凭管理令牌追溯）
+# ---------------------------------------------------------------------------
+
+@app.get("/api/tests/{test_code}/timeline")
+def get_timeline(test_code: str, token: str):
+    """负责人时间线：创建、名单调整、答卷/弃权、结算，按提交顺序稳定排列。
+
+    - 仅凭管理令牌可查（与进度接口同一凭证）。
+    - 结算前答卷事件只显示「已作答 / 已弃权」，不透露选杯、异样杯与对错；
+      结算后答卷事件才附答案与判定。
+    - 旧库实验以 recording_started 事件标示记录起点，history_complete=false，
+      不虚构既往历史。
+    """
+    row = require_admin(test_code, token)
+    conn = db.read_conn()
+    try:
+        rows = conn.execute(
+            "SELECT seq, at, type, panelist, payload FROM events "
+            "WHERE test_id = ? ORDER BY seq",
+            (row["id"],),
+        ).fetchall()
+    finally:
+        conn.close()
+
+    settled = row["settled_at"] is not None
+    events = []
+    for r in rows:
+        detail = json.loads(r["payload"])
+        if r["type"] == "answer":
+            # 结算前过滤答案与判定，只保留「已作答」事实
+            detail = {"result": "answered"} if not settled else {
+                "result": "answered",
+                "answer": detail.get("answer"),
+                "correct": detail.get("correct"),
+            }
+        elif r["type"] == "abstain":
+            detail = {"result": "abstained"}
+        events.append({
+            "seq": r["seq"],
+            "at": r["at"] * 1000,  # 与其它接口一致，输出毫秒
+            "type": r["type"],
+            "panelist": r["panelist"],
+            "detail": detail,
+        })
+
+    return {
+        "test_code": row["code"],
+        "now": now_ts() * 1000,
+        "settled": settled,
+        # 旧库实验无 created 事件，历史自 recording_started 起点开始
+        "history_complete": any(r["type"] == "created" for r in rows),
+        "events": events,
     }
 
 

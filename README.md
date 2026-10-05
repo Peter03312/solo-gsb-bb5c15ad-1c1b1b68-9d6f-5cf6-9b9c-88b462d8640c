@@ -30,6 +30,12 @@
      任一校验失败则**整次操作无效**（事务回滚，不留中间态）；
    - 截止或结算后一律拒绝调整；与答卷并发时按**实际先完成**的操作判定
      （答卷先完成则撤回报「已作答」，撤回先完成则旧码立即失效、答卷按 404 拒绝）。
+8. **操作时间线（按时间追溯）**：凭管理凭证查询本场实验从创建到结算的逐笔记录——
+   创建、名单调整（一次调整记为一笔，含撤回与补位明细）、评员答卷/弃权、结算形成，
+   每笔含服务端时间、操作类型、关联评员与结果，按提交顺序稳定排列；
+   事件与状态变更原子提交，任一校验失败不留记录；
+   结算前答卷只显示「已答 / 弃权」，结算后才显示选杯与判定；
+   时间线功能上线前的旧实验以「记录起点」事件明确标示，不虚构既往历史。
 
 **评员**
 
@@ -101,7 +107,8 @@ uvicorn app.main:app --host 0.0.0.0 --port 8080
 
 测试仅依赖 Python 标准库，会启动真实 uvicorn 子进程走完整 HTTP 流程
 （统计函数交叉验证、输入校验、盲态保密、一次提交、截止拒答、结算判定、冻结、回看、
-撤回/补位、均衡再分配、有效人数上下限、撤回与答卷并发竞争）：
+撤回/补位、均衡再分配、有效人数上下限、撤回与答卷并发竞争、
+操作时间线的记录/保密/鉴权/失败不留痕、旧库迁移记录起点）：
 
 ```bash
 pip install -r requirements.txt
@@ -116,6 +123,7 @@ python tests/smoke_test.py
 | GET  | `/api/tests/{code}?token=` | 负责人进度（截止前仅汇总计数 + 分发链接） |
 | POST | `/api/tests/{code}/adjust` | 截止前撤回盲评码 / 补位评员（可单用或合用） |
 | POST | `/api/tests/{code}/settle` | 截止后结算（重复调用返回冻结结果） |
+| GET  | `/api/tests/{code}/timeline?token=` | 负责人操作时间线（创建/调整/答卷/结算逐笔记录） |
 | GET  | `/api/eval/{code}` | 评员视图（结算前无任何分配/样本信息） |
 | POST | `/api/eval/{code}/submit` | 提交 `{"answer":1|2|3}` 或 `{"abstain":true}` |
 | GET  | `/api/time` | 服务端当前时间（毫秒） |
@@ -180,6 +188,69 @@ curl -X POST http://localhost:8080/api/tests/AbCdEf12/adjust \
 | 422 | 姓名重复（含与已撤回者重名）、撤回码重复、空操作、有效人数低于最少有效数或超过 500 |
 
 管理台页面（`/admin`）在截止前也提供「名单调整」卡片，支持按行粘贴盲评码与姓名直接操作。
+
+### 操作时间线接口调用示例
+
+`GET /api/tests/{test_code}/timeline?token=负责人令牌` —— 仅该实验负责人凭管理令牌可查，
+按提交顺序（`seq` 从 1 起连续递增）返回创建、名单调整、答卷/弃权、结算的逐笔记录：
+
+```bash
+curl "http://localhost:8080/api/tests/AbCdEf12/timeline?token=负责人令牌"
+```
+
+响应（结算前：答卷只显示「已作答 / 已弃权」，不透露选杯、异样杯与对错）：
+
+```json
+{
+  "test_code": "AbCdEf12",
+  "now": 1759651200000,
+  "settled": false,
+  "history_complete": true,
+  "events": [
+    {"seq": 1, "at": 1759640000000, "type": "created", "panelist": null,
+     "detail": {"sample_a": "X-100", "sample_b": "X-200", "panelist_count": 6,
+                "deadline": 1759670000000, "min_valid": 6}},
+    {"seq": 2, "at": 1759641000000, "type": "answer", "panelist": "张三",
+     "detail": {"result": "answered"}},
+    {"seq": 3, "at": 1759642000000, "type": "abstain", "panelist": "李四",
+     "detail": {"result": "abstained"}},
+    {"seq": 4, "at": 1759643000000, "type": "roster_adjusted", "panelist": null,
+     "detail": {"withdrawn": [{"panelist": "王五", "code": "kPq7mWx2Za"}],
+                "added": [{"panelist": "赵六", "code": "A2bcDeFGhJ"}],
+                "active_count": 6}}
+  ]
+}
+```
+
+结算后同一接口中，答卷事件解锁答案与判定，并出现结算事件：
+
+```json
+{"seq": 2, "at": 1759641000000, "type": "answer", "panelist": "张三",
+ "detail": {"result": "answered", "answer": 2, "correct": true}}
+```
+
+```json
+{"seq": 9, "at": 1759671000000, "type": "settled", "panelist": null,
+ "detail": {"valid_count": 5, "correct_count": 4, "abstained_count": 1,
+            "missing_count": 0, "p_value": 0.0453, "min_valid": 6,
+            "distinguishable": false}}
+```
+
+字段与规则：
+
+| 字段 | 说明 |
+| --- | --- |
+| `events[].seq` | 实验内从 1 起连续递增的序号，即提交顺序（事件与状态变更同事务原子提交，并发下顺序与最终状态一致） |
+| `events[].at` | 服务端时间，Unix 毫秒 |
+| `events[].type` | `created` 创建 / `roster_adjusted` 名单调整（一笔含 `withdrawn` 与 `added` 明细）/ `answer` 答卷 / `abstain` 弃权 / `settled` 结算 / `recording_started` 记录起点 |
+| `events[].panelist` | 关联评员（答卷/弃权），其余为 `null` |
+| `history_complete` | `true` 表示自创建起全程有记录；`false` 表示该实验创建于时间线功能上线前，首条为 `recording_started` 事件，既往操作未被虚构补全 |
+
+- 失败的答卷（重复提交、截止后提交）与失败的调整（任一校验失败）**不会留下任何事件**；
+- 重复结算返回同一份冻结结果，不会重复记录 `settled` 事件；
+- 鉴权失败与进度接口一致：测试不存在 404、令牌无效 403。
+
+管理台页面（`/admin`）底部的「操作时间线」卡片即由该接口渲染。
 
 ## 安全与使用注意
 
